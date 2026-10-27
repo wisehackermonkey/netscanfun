@@ -1,0 +1,35 @@
+# Docker specific
+.env
+.git/
+logs
+*.log
+npm-debug.log*
+node_modules
+# vscode workspace files are user-specific
+*.sublime-workspace
+# Folder config file
+Desktop.ini
+# Docker
+docker-compose.yml
+.dockerignore
+.docker
+
+# Docker Hub metadata
+.dockercfg
+
+# Docker volumes
+docker/data
+
+# Docker build stage
+target/
+
+# Misc
+.DS_Store
+.env
+.venv
+venv/
+
+# editor and IDE paraphernalia
+.idea
+*.swp
+*.swo 
