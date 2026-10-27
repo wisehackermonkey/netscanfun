@@ -23,7 +23,17 @@ gcc ./src/netfun.c -o ./netfun
 sudo ./netfun 126.235.0.1
 
 gcc ./src/netfun.c -o ./netfun ; sudo ./netfun 126.235.0.1
+
+gcc ./src/netfun.c -o ./netfun; sudo ./netfun 126.235.0.1 to 126.235.170.163 1000
+
+time sudo ./netfun  126.235.0.1 to 126.235.170.163 1000
+time sudo ./netfun 73.0.0.0 to 73.0.0.254 1000 > ./scans/output1.txt
+time sudo ./netfun 50.106.170.112 to 50.110.170.176 1000 > ./scans/output1.txt
+tail -f ./scans/output1.txt
+
+--no-dns
 ```
+
 
 # Summary
 ### -  *[Installation](#Installation)*
