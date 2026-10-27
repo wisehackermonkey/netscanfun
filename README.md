@@ -19,6 +19,10 @@
 cd ~
 git clone https://github.com/wisehackermonkey/netscanfun.git
 cd netscanfun
+gcc ./src/netfun.c -o ./netfun
+sudo ./netfun 126.235.0.1
+
+gcc ./src/netfun.c -o ./netfun ; sudo ./netfun 126.235.0.1
 ```
 
 # Summary
