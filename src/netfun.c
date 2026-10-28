@@ -1,11 +1,12 @@
 // icmp_sweep.c - ICMP ping sweep over an IPv4 range (requires root / CAP_NET_RAW)
 //
 // build:  gcc -std=gnu11 -O2 -Wall -Wextra -o icmp_sweep icmp_sweep.c
-// usage:  sudo ./icmp_sweep <start_ip> <end_ip> [timeout_ms]
+// usage:  sudo ./icmp_sweep <start_ip> <end_ip> [timeout_ms] [--no-dns]
 //         sudo ./icmp_sweep 126.235.0.1 to 126.235.170.163 1000
 //
 // output (CSV, one line per IP, in order):
-//   ip,ping_ms,icmp_type,icmp_code,ttl,status
+//   ip,ping_ms,icmp_type,icmp_code,ttl,status,hostname
+//   (hostname = reverse dns of the probed ip, "-" if none / not looked up)
 //
 //   echo reply        : 126.235.0.1,12.345,0,0,52,reply
 //   ICMP error reply  : 126.235.0.7,3.210,3,1,250,destination host unreachable
@@ -16,6 +17,7 @@
 #define _DEFAULT_SOURCE
 #include <arpa/inet.h>
 #include <errno.h>
+#include <netdb.h>
 #include <netinet/in.h>
 #include <netinet/ip.h>
 #include <netinet/ip_icmp.h>
@@ -197,6 +199,25 @@ static void handle_packet(const uint8_t * buf, ssize_t len, target_t * targets, 
     }
 }
 
+static bool g_resolve_names = true; // cleared by --no-dns
+
+// lookup the dns-name associated with an ip address (host byte order)
+static bool reverse_dns_lookup(uint32_t ip_host_order, char * name_out, size_t size)
+{
+    struct sockaddr_in addr;
+    zero_initialize(&addr, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(ip_host_order);
+
+    char buffer[NI_MAXHOST];
+    if (getnameinfo((struct sockaddr *)&addr, sizeof(addr), buffer, sizeof(buffer), NULL, 0, NI_NAMEREQD) != 0)
+    {
+        return false;
+    }
+    snprintf(name_out, size, "%s", buffer);
+    return true;
+}
+
 static void print_result(const target_t * t)
 {
     char ipstr[INET_ADDRSTRLEN];
@@ -204,20 +225,33 @@ static void print_result(const target_t * t)
     a.s_addr = htonl(t->ip);
     inet_ntop(AF_INET, &a, ipstr, sizeof(ipstr));
 
+    // only hosts that answered something are resolved, otherwise every silent
+    // address would cost a full dns lookup
+    char name[NI_MAXHOST];
+    if (!(g_resolve_names && t->got_reply && reverse_dns_lookup(t->ip, name, sizeof(name))))
+    {
+        snprintf(name, sizeof(name), "-");
+    }
+
     if (!t->got_reply)
     {
-        printf("%15s,        -1,-1,-1,unresponsive,timeout\n", ipstr);
+        printf("%15s,        -1,-1,-1,unresponsive,timeout,%s\n", ipstr, name);
     }
     else
     {
-        printf("%15s,%10.3f, %d, %d, %d, %s\n", ipstr, t->ms, t->type, t->code, t->ttl, describe(t->type, t->code));
+        printf("%15s,%10.3f, %d, %d, %d, %s, %s\n", ipstr, t->ms, t->type, t->code, t->ttl,
+               describe(t->type, t->code), name);
     }
 }
 
 static int run_batch(int fd, uint16_t id, uint32_t first_ip, int count, int timeout_ms)
 {
-    target_t targets[BATCH_SIZE];
-    zero_initialize(targets, sizeof(targets));
+    target_t * targets = calloc(BATCH_SIZE, sizeof(target_t)); // too big for the stack
+    if (targets == NULL)
+    {
+        perror("calloc");
+        return -1;
+    }
 
     // send everything in the batch
     for (int i = 0; i < count; ++i)
@@ -261,6 +295,7 @@ static int run_batch(int fd, uint16_t id, uint32_t first_ip, int count, int time
             if (errno == EINTR)
                 continue;
             perror("poll");
+            free(targets);
             return -1;
         }
         if (pr == 0)
@@ -285,6 +320,7 @@ static int run_batch(int fd, uint16_t id, uint32_t first_ip, int count, int time
     for (int i = 0; i < count; ++i)
         print_result(&targets[i]);
     fflush(stdout);
+    free(targets);
     return 0;
 }
 
@@ -299,6 +335,20 @@ static bool parse_ip(const char * s, uint32_t * out)
 
 int main(int argc, char * argv[])
 {
+    // strip the --no-dns flag out of argv
+    for (int i = 1; i < argc;)
+    {
+        if (strcmp(argv[i], "--no-dns") == 0)
+        {
+            g_resolve_names = false;
+            for (int j = i; j < argc - 1; ++j)
+                argv[j] = argv[j + 1];
+            --argc;
+            continue;
+        }
+        ++i;
+    }
+
     // allow "start to end" as well as "start end"
     if (argc >= 4 && strcmp(argv[2], "to") == 0)
     {
@@ -308,7 +358,7 @@ int main(int argc, char * argv[])
     }
     if (argc < 3)
     {
-        fprintf(stderr, "usage: %s <start_ip> <end_ip> [timeout_ms]\n", argv[0]);
+        fprintf(stderr, "usage: %s <start_ip> <end_ip> [timeout_ms] [--no-dns]\n", argv[0]);
         return 1;
     }
 
@@ -335,7 +385,7 @@ int main(int argc, char * argv[])
     }
 
     const uint16_t id = (uint16_t)getpid();
-    printf("ip,ping_ms,icmp_type,icmp_code,ttl,status\n");
+    printf("ip,ping_ms,icmp_type,icmp_code,ttl,status,hostname\n");
 
     for (uint64_t ip = start; ip <= end; ip += BATCH_SIZE)
     {

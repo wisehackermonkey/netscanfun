@@ -29,8 +29,15 @@ gcc ./src/netfun.c -o ./netfun; sudo ./netfun 126.235.0.1 to 126.235.170.163 100
 time sudo ./netfun  126.235.0.1 to 126.235.170.163 1000
 time sudo ./netfun 73.0.0.0 to 73.0.0.254 1000 > ./scans/output1.txt
 time sudo ./netfun 50.106.170.112 to 50.110.170.176 1000 > ./scans/output1.txt
+
+gcc ./src/netfun.c -o ./netfun;  time sudo ./netfun 50.106.170.112 to 50.110.170.176 1000 > ./scans/output1.txt
+real    7m59.856s preopimizatio with reverse dns lookup
 tail -f ./scans/output1.txt
 
+gcc ./src/netfun.c -o ./netfun;  time sudo ./netfun 50.106.170.112 to 50.110.170.176 1000 --dns-threads 128 > ./scans/output2.txt
+tail -f ./scans/output2.txt
+
+--dns-threads 128
 --no-dns
 ```
 
