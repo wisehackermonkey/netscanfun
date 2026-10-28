@@ -1,8 +1,11 @@
 // icmp_sweep.c - ICMP ping sweep over an IPv4 range (requires root / CAP_NET_RAW)
 //
-// build:  gcc -std=gnu11 -O2 -Wall -Wextra -o icmp_sweep icmp_sweep.c
-// usage:  sudo ./icmp_sweep <start_ip> <end_ip> [timeout_ms] [--no-dns]
+// build:  gcc -std=gnu11 -O2 -Wall -Wextra -pthread -o icmp_sweep icmp_sweep.c
+// usage:  sudo ./icmp_sweep <start_ip> <end_ip> [timeout_ms] [--no-dns] [--dns-threads N]
 //         sudo ./icmp_sweep 126.235.0.1 to 126.235.170.163 1000
+//
+// the whole range is swept first, then reverse dns is done only for the hosts that
+// answered, then the log is printed (progress goes to stderr).
 //
 // output (CSV, one line per IP, in order):
 //   ip,ping_ms,icmp_type,icmp_code,ttl,status,hostname
@@ -22,6 +25,7 @@
 #include <netinet/ip.h>
 #include <netinet/ip_icmp.h>
 #include <poll.h>
+#include <pthread.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -51,6 +55,7 @@ typedef struct
     int type;
     int code;
     int ttl;
+    char * name;          // reverse dns name (malloc'd), NULL if none / not looked up
     struct timespec sent;
 } target_t;
 
@@ -199,7 +204,8 @@ static void handle_packet(const uint8_t * buf, ssize_t len, target_t * targets, 
     }
 }
 
-static bool g_resolve_names = true; // cleared by --no-dns
+#define DEFAULT_DNS_THREADS 64
+static int g_dns_threads = DEFAULT_DNS_THREADS; // 0 disables reverse dns (--no-dns)
 
 // lookup the dns-name associated with an ip address (host byte order)
 static bool reverse_dns_lookup(uint32_t ip_host_order, char * name_out, size_t size)
@@ -218,6 +224,133 @@ static bool reverse_dns_lookup(uint32_t ip_host_order, char * name_out, size_t s
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// reverse dns thread pool
+//
+// getnameinfo() blocks for as long as the resolver takes (up to seconds for a
+// missing PTR record). Doing that one address at a time is by far the slowest
+// part of a sweep, so a fixed set of worker threads pulls targets from a shared
+// index and resolves them concurrently. Each job touches only its own
+// target_t, so the only shared state is the job counter, protected by a mutex.
+// ---------------------------------------------------------------------------
+typedef struct
+{
+    pthread_t * threads;
+    int thread_count;
+    pthread_mutex_t lock;
+    pthread_cond_t work_cv; // signalled when a new batch of jobs is available
+    pthread_cond_t done_cv; // signalled when the last job of a batch finished
+    target_t ** jobs;       // responders to resolve
+    int count;              // number of jobs
+    int next;               // next target to hand out
+    int pending;            // jobs not finished yet
+    bool shutdown;
+} dns_pool_t;
+
+static void * dns_worker(void * arg)
+{
+    dns_pool_t * pool = (dns_pool_t *)arg;
+
+    pthread_mutex_lock(&pool->lock);
+    for (;;)
+    {
+        while (!pool->shutdown && pool->next >= pool->count)
+        {
+            pthread_cond_wait(&pool->work_cv, &pool->lock);
+        }
+        if (pool->shutdown)
+        {
+            break;
+        }
+
+        target_t * t = pool->jobs[pool->next++];
+        pthread_mutex_unlock(&pool->lock);
+
+        // the slow part, runs without the lock held
+        char name[NI_MAXHOST];
+        if (reverse_dns_lookup(t->ip, name, sizeof(name)))
+        {
+            t->name = strdup(name);
+        }
+
+        pthread_mutex_lock(&pool->lock);
+        if (--pool->pending == 0)
+        {
+            pthread_cond_signal(&pool->done_cv);
+        }
+    }
+    pthread_mutex_unlock(&pool->lock);
+    return NULL;
+}
+
+static dns_pool_t * dns_pool_create(int thread_count)
+{
+    dns_pool_t * pool = calloc(1, sizeof(*pool));
+    if (pool == NULL)
+        return NULL;
+    pool->threads = calloc((size_t)thread_count, sizeof(pthread_t));
+    if (pool->threads == NULL)
+    {
+        free(pool);
+        return NULL;
+    }
+    pthread_mutex_init(&pool->lock, NULL);
+    pthread_cond_init(&pool->work_cv, NULL);
+    pthread_cond_init(&pool->done_cv, NULL);
+
+    for (int i = 0; i < thread_count; ++i)
+    {
+        if (pthread_create(&pool->threads[i], NULL, dns_worker, pool) != 0)
+            break;
+        ++pool->thread_count;
+    }
+    if (pool->thread_count == 0)
+    {
+        free(pool->threads);
+        free(pool);
+        return NULL;
+    }
+    return pool;
+}
+
+// resolve all given targets, blocks until every lookup is finished
+static void dns_pool_run(dns_pool_t * pool, target_t ** jobs, int count)
+{
+    pthread_mutex_lock(&pool->lock);
+    pool->jobs = jobs;
+    pool->count = count;
+    pool->next = 0;
+    pool->pending = count;
+    pthread_cond_broadcast(&pool->work_cv);
+    while (pool->pending > 0)
+    {
+        pthread_cond_wait(&pool->done_cv, &pool->lock);
+    }
+    pool->jobs = NULL;
+    pool->count = 0;
+    pool->next = 0;
+    pthread_mutex_unlock(&pool->lock);
+}
+
+static void dns_pool_destroy(dns_pool_t * pool)
+{
+    if (pool == NULL)
+        return;
+    pthread_mutex_lock(&pool->lock);
+    pool->shutdown = true;
+    pthread_cond_broadcast(&pool->work_cv);
+    pthread_mutex_unlock(&pool->lock);
+    for (int i = 0; i < pool->thread_count; ++i)
+    {
+        pthread_join(pool->threads[i], NULL);
+    }
+    pthread_mutex_destroy(&pool->lock);
+    pthread_cond_destroy(&pool->work_cv);
+    pthread_cond_destroy(&pool->done_cv);
+    free(pool->threads);
+    free(pool);
+}
+
 static void print_result(const target_t * t)
 {
     char ipstr[INET_ADDRSTRLEN];
@@ -225,13 +358,9 @@ static void print_result(const target_t * t)
     a.s_addr = htonl(t->ip);
     inet_ntop(AF_INET, &a, ipstr, sizeof(ipstr));
 
-    // only hosts that answered something are resolved, otherwise every silent
-    // address would cost a full dns lookup
-    char name[NI_MAXHOST];
-    if (!(g_resolve_names && t->got_reply && reverse_dns_lookup(t->ip, name, sizeof(name))))
-    {
-        snprintf(name, sizeof(name), "-");
-    }
+    // names were filled in by the dns thread pool (only hosts that answered
+    // something are resolved, otherwise every silent address would cost a lookup)
+    const char * name = t->name != NULL ? t->name : "-";
 
     if (!t->got_reply)
     {
@@ -244,15 +373,9 @@ static void print_result(const target_t * t)
     }
 }
 
-static int run_batch(int fd, uint16_t id, uint32_t first_ip, int count, int timeout_ms)
+// phase 1: ping one batch of addresses. 'targets' is this batch's slice of the result array.
+static int run_batch(int fd, uint16_t id, uint32_t first_ip, target_t * targets, int count, int timeout_ms)
 {
-    target_t * targets = calloc(BATCH_SIZE, sizeof(target_t)); // too big for the stack
-    if (targets == NULL)
-    {
-        perror("calloc");
-        return -1;
-    }
-
     // send everything in the batch
     for (int i = 0; i < count; ++i)
     {
@@ -295,7 +418,6 @@ static int run_batch(int fd, uint16_t id, uint32_t first_ip, int count, int time
             if (errno == EINTR)
                 continue;
             perror("poll");
-            free(targets);
             return -1;
         }
         if (pr == 0)
@@ -316,11 +438,6 @@ static int run_batch(int fd, uint16_t id, uint32_t first_ip, int count, int time
             if (!targets[i].done)
                 ++outstanding;
     }
-
-    for (int i = 0; i < count; ++i)
-        print_result(&targets[i]);
-    fflush(stdout);
-    free(targets);
     return 0;
 }
 
@@ -335,18 +452,33 @@ static bool parse_ip(const char * s, uint32_t * out)
 
 int main(int argc, char * argv[])
 {
-    // strip the --no-dns flag out of argv
+    // strip the options (--no-dns, --dns-threads N) out of argv
     for (int i = 1; i < argc;)
     {
+        int remove_count = 0;
         if (strcmp(argv[i], "--no-dns") == 0)
         {
-            g_resolve_names = false;
-            for (int j = i; j < argc - 1; ++j)
-                argv[j] = argv[j + 1];
-            --argc;
+            g_dns_threads = 0;
+            remove_count = 1;
+        }
+        else if (strcmp(argv[i], "--dns-threads") == 0)
+        {
+            if (i + 1 >= argc || atoi(argv[i + 1]) < 1)
+            {
+                fprintf(stderr, "--dns-threads needs a number >= 1\n");
+                return 1;
+            }
+            g_dns_threads = atoi(argv[i + 1]);
+            remove_count = 2;
+        }
+        if (remove_count == 0)
+        {
+            ++i;
             continue;
         }
-        ++i;
+        for (int j = i; j + remove_count < argc; ++j)
+            argv[j] = argv[j + remove_count];
+        argc -= remove_count;
     }
 
     // allow "start to end" as well as "start end"
@@ -358,7 +490,7 @@ int main(int argc, char * argv[])
     }
     if (argc < 3)
     {
-        fprintf(stderr, "usage: %s <start_ip> <end_ip> [timeout_ms] [--no-dns]\n", argv[0]);
+        fprintf(stderr, "usage: %s <start_ip> <end_ip> [timeout_ms] [--no-dns] [--dns-threads N]\n", argv[0]);
         return 1;
     }
 
@@ -385,16 +517,79 @@ int main(int argc, char * argv[])
     }
 
     const uint16_t id = (uint16_t)getpid();
-    printf("ip,ping_ms,icmp_type,icmp_code,ttl,status,hostname\n");
 
-    for (uint64_t ip = start; ip <= end; ip += BATCH_SIZE)
+    // results for the whole range are kept in memory so the dns phase can run after the sweep
+    const uint64_t total = (uint64_t)end - start + 1;
+    target_t * targets = calloc(total, sizeof(target_t));
+    if (targets == NULL)
     {
-        uint64_t remaining = (uint64_t)end - ip + 1;
-        int count = remaining < BATCH_SIZE ? (int)remaining : BATCH_SIZE;
-        if (run_batch(fd, id, (uint32_t)ip, count, timeout_ms) != 0)
-            break;
+        fprintf(stderr, "not enough memory for %llu addresses, use a smaller range\n", (unsigned long long)total);
+        close(fd);
+        return 1;
     }
 
+    // ---- phase 1: icmp sweep of the whole range ----
+    for (uint64_t done = 0; done < total; done += BATCH_SIZE)
+    {
+        uint64_t remaining = total - done;
+        int count = remaining < BATCH_SIZE ? (int)remaining : BATCH_SIZE;
+        if (run_batch(fd, id, (uint32_t)(start + done), &targets[done], count, timeout_ms) != 0)
+        {
+            free(targets);
+            close(fd);
+            return 1;
+        }
+        fprintf(stderr, "swept %llu/%llu addresses\r", (unsigned long long)(done + count), (unsigned long long)total);
+    }
+    fprintf(stderr, "\n");
     close(fd);
+
+    // ---- phase 2: reverse dns, only for the addresses that responded ----
+    if (g_dns_threads > 0)
+    {
+        size_t responders = 0;
+        for (uint64_t i = 0; i < total; ++i)
+            if (targets[i].got_reply)
+                ++responders;
+
+        if (responders > 0)
+        {
+            target_t ** jobs = malloc(responders * sizeof(*jobs));
+            if (jobs != NULL)
+            {
+                size_t n = 0;
+                for (uint64_t i = 0; i < total; ++i)
+                    if (targets[i].got_reply)
+                        jobs[n++] = &targets[i];
+
+                int thread_count = g_dns_threads;
+                if ((size_t)thread_count > responders)
+                    thread_count = (int)responders; // no point in more threads than lookups
+
+                fprintf(stderr, "resolving %zu responding hosts with %d threads...\n", responders, thread_count);
+                dns_pool_t * dns_pool = dns_pool_create(thread_count);
+                if (dns_pool != NULL)
+                {
+                    dns_pool_run(dns_pool, jobs, (int)responders);
+                    dns_pool_destroy(dns_pool);
+                }
+                else
+                {
+                    fprintf(stderr, "could not create dns thread pool, reverse dns skipped\n");
+                }
+                free(jobs);
+            }
+        }
+    }
+
+    // ---- phase 3: output, one line per ip in order ----
+    printf("ip,ping_ms,icmp_type,icmp_code,ttl,status,hostname\n");
+    for (uint64_t i = 0; i < total; ++i)
+    {
+        print_result(&targets[i]);
+        free(targets[i].name);
+    }
+    fflush(stdout);
+    free(targets);
     return 0;
 }

@@ -36,6 +36,12 @@ tail -f ./scans/output1.txt
 
 gcc ./src/netfun.c -o ./netfun;  time sudo ./netfun 50.106.170.112 to 50.110.170.176 1000 --dns-threads 128 > ./scans/output2.txt
 tail -f ./scans/output2.txt
+real    0m19.098s YEAH! thas great
+------
+gcc ./src/netfun.c -o ./netfun;  time sudo ./netfun 50.106.170.112 to 50.110.170.176 1000 --dns-threads 1000 > ./scans/output2.txt
+
+real    0m7.711s yes faster not crazy amount
+
 
 --dns-threads 128
 --no-dns
